@@ -27,7 +27,6 @@ class IP_Status_Lamp {
     private function __construct() {
         add_action('admin_menu', [$this, 'add_admin_menu']);
         add_action('admin_init', [$this, 'register_settings']);
-        add_action('rest_api_init', [$this, 'register_rest_route']);
         add_action('wp_enqueue_scripts', [$this, 'enqueue_frontend_assets']);
         add_shortcode('ip_status_lamp', [$this, 'render_shortcode']);
 
@@ -90,7 +89,6 @@ class IP_Status_Lamp {
     public function get_settings() {
         $defaults = [
             'target_ip' => '',
-            'ping_interval' => 5,
             'ping_count' => 3,
             'timeout' => 2,
             'label_online' => 'Онлайн',
@@ -138,14 +136,6 @@ class IP_Status_Lamp {
             'target_ip',
             'IP-адреса для моніторингу',
             [$this, 'render_field_ip'],
-            'ip-status-lamp',
-            'ip_status_lamp_main'
-        );
-        
-        add_settings_field(
-            'ping_interval',
-            'Інтервал перевірки (хвилин)',
-            [$this, 'render_field_interval'],
             'ip-status-lamp',
             'ip_status_lamp_main'
         );
@@ -208,19 +198,12 @@ class IP_Status_Lamp {
     }
     
     public function sanitize_settings($input) {
-        // Скинути кеш при зміні налаштувань
-        delete_transient('ip_status_lamp_result');
-
         $sanitized = [];
-        
+
         // IP-адреса: валідація IP або домену
         $target = sanitize_text_field($input['target_ip'] ?? '');
         $sanitized['target_ip'] = $this->validate_target($target);
-        
-        // Інтервал: 1-60 хвилин
-        $sanitized['ping_interval'] = absint($input['ping_interval'] ?? 5);
-        $sanitized['ping_interval'] = max(1, min(60, $sanitized['ping_interval']));
-        
+
         // Кількість пінгів: 1-10
         $sanitized['ping_count'] = absint($input['ping_count'] ?? 3);
         $sanitized['ping_count'] = max(1, min(10, $sanitized['ping_count']));
@@ -331,14 +314,6 @@ class IP_Status_Lamp {
         echo '<p class="description">IP-адреса або доменне ім\'я для перевірки</p>';
     }
     
-    public function render_field_interval() {
-        $settings = $this->get_settings();
-        echo '<input type="number" name="' . $this->option_name . '[ping_interval]" 
-              value="' . esc_attr($settings['ping_interval']) . '" 
-              min="1" max="60" style="width: 80px;"> хвилин';
-        echo '<p class="description">Мінімальний інтервал між реальними PING-перевірками (кеш)</p>';
-    }
-    
     public function render_field_ping_count() {
         $settings = $this->get_settings();
         echo '<input type="number" name="' . $this->option_name . '[ping_count]" 
@@ -430,8 +405,13 @@ class IP_Status_Lamp {
     }
     
     private function render_test_section() {
+        if (!function_exists('exec') || in_array('exec', array_map('trim', explode(',', ini_get('disable_functions'))))) {
+            echo '<p style="color: #d63638;">⚠️ Функція exec() недоступна на цьому сервері. Плагін не зможе виконувати PING.</p>';
+            return;
+        }
+
         $settings = $this->get_settings();
-        
+
         if (empty($settings['target_ip'])) {
             echo '<p style="color: #d63638;">⚠️ Спочатку вкажіть IP-адресу в налаштуваннях</p>';
             return;
@@ -529,54 +509,6 @@ class IP_Status_Lamp {
             'successful' => $successful,
             'total' => $count,
             'checked_at' => current_time('mysql'),
-        ];
-    }
-    
-    /**
-     * Отримати статус з кешу (transient) або виконати ping
-     */
-    public function get_cached_status() {
-        $transient_key = 'ip_status_lamp_result';
-        $cached = get_transient($transient_key);
-
-        if (false !== $cached) {
-            return $cached;
-        }
-
-        $result = $this->perform_ping();
-        $settings = $this->get_settings();
-        $ttl = max(1, (int) $settings['ping_interval']) * 60;
-
-        set_transient($transient_key, $result, $ttl);
-
-        return $result;
-    }
-
-    /**
-     * ========================================
-     * REST API
-     * ========================================
-     */
-    
-    public function register_rest_route() {
-        register_rest_route('ip-status-lamp/v1', '/status', [
-            'methods' => 'GET',
-            'callback' => [$this, 'rest_get_status'],
-            'permission_callback' => function () {
-                return current_user_can('manage_options');
-            },
-        ]);
-    }
-    
-    public function rest_get_status() {
-        $result = $this->get_cached_status();
-        $settings = $this->get_settings();
-
-        return [
-            'online' => $result['online'],
-            'label' => $result['online'] ? $settings['label_online'] : $settings['label_offline'],
-            'checked_at' => $result['checked_at'],
-            'timestamp' => time(),
         ];
     }
     
@@ -704,7 +636,7 @@ class IP_Status_Lamp {
         ], $atts);
 
         $settings = $this->get_settings();
-        $result = $this->get_cached_status();
+        $result = $this->perform_ping();
 
         // Позиція: з shortcode або з налаштувань
         $position = !empty($atts['position']) ? $atts['position'] : $settings['position'];
