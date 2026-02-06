@@ -30,8 +30,60 @@ class IP_Status_Lamp {
         add_action('rest_api_init', [$this, 'register_rest_route']);
         add_action('wp_enqueue_scripts', [$this, 'enqueue_frontend_assets']);
         add_shortcode('ip_status_lamp', [$this, 'render_shortcode']);
+
+        // Заборона кешування для сторінок з shortcode
+        add_action('template_redirect', [$this, 'disable_page_cache']);
     }
-    
+
+    /**
+     * Заборона кешування сторінок з віджетом
+     */
+    public function disable_page_cache() {
+        global $post;
+
+        if (!is_singular() || empty($post)) {
+            return;
+        }
+
+        if (has_shortcode($post->post_content, 'ip_status_lamp')) {
+            // Константи для плагінів кешування
+            if (!defined('DONOTCACHEPAGE')) {
+                define('DONOTCACHEPAGE', true);
+            }
+            if (!defined('DONOTCACHEDB')) {
+                define('DONOTCACHEDB', true);
+            }
+            if (!defined('DONOTMINIFY')) {
+                define('DONOTMINIFY', true);
+            }
+            if (!defined('DONOTCDN')) {
+                define('DONOTCDN', true);
+            }
+
+            // Агресивні HTTP заголовки
+            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0');
+            header('Pragma: no-cache');
+            header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
+            header('Vary: *');
+
+            // Cloudflare специфічні
+            header('CDN-Cache-Control: no-store');
+            header('Cloudflare-CDN-Cache-Control: no-store');
+
+            // Meta теги через wp_head
+            add_action('wp_head', [$this, 'add_no_cache_meta'], 1);
+        }
+    }
+
+    /**
+     * Meta теги для заборони кешування
+     */
+    public function add_no_cache_meta() {
+        echo '<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">' . "\n";
+        echo '<meta http-equiv="Pragma" content="no-cache">' . "\n";
+        echo '<meta http-equiv="Expires" content="0">' . "\n";
+    }
+
     /**
      * Отримати налаштування плагіна
      */
@@ -545,7 +597,7 @@ class IP_Status_Lamp {
             'ip-status-lamp',
             false,
             [],
-            '2.1.0'
+            time()
         );
         wp_enqueue_style('ip-status-lamp');
         wp_add_inline_style('ip-status-lamp', $this->get_inline_css());
