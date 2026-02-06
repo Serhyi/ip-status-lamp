@@ -3,7 +3,7 @@
  * Plugin Name: IP Status Lamp
  * Plugin URI: https://www.mipaudit.com/
  * Description: Віджет-лампочка для моніторингу доступності IP через PING
- * Version: 2.0.0
+ * Version: 2.1.0
  * Author: MIP Audit
  * Text Domain: ip-status-lamp
  */
@@ -30,59 +30,6 @@ class IP_Status_Lamp {
         add_action('rest_api_init', [$this, 'register_rest_route']);
         add_action('wp_enqueue_scripts', [$this, 'enqueue_frontend_assets']);
         add_shortcode('ip_status_lamp', [$this, 'render_shortcode']);
-        
-        // Заборона кешування для сторінок з shortcode
-        add_action('template_redirect', [$this, 'disable_page_cache']);
-    }
-    
-    /**
-     * Заборона кешування сторінок з віджетом
-     */
-    public function disable_page_cache() {
-        global $post;
-        
-        if (!is_singular() || empty($post)) {
-            return;
-        }
-        
-        // Перевірити чи сторінка містить наш shortcode
-        if (has_shortcode($post->post_content, 'ip_status_lamp')) {
-            // Константи для плагінів кешування
-            if (!defined('DONOTCACHEPAGE')) {
-                define('DONOTCACHEPAGE', true);
-            }
-            if (!defined('DONOTCACHEDB')) {
-                define('DONOTCACHEDB', true);
-            }
-            if (!defined('DONOTMINIFY')) {
-                define('DONOTMINIFY', true);
-            }
-            if (!defined('DONOTCDN')) {
-                define('DONOTCDN', true);
-            }
-            
-            // Агресивні HTTP заголовки
-            header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0, post-check=0, pre-check=0');
-            header('Pragma: no-cache');
-            header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
-            header('Vary: *');
-            
-            // Cloudflare специфічні
-            header('CDN-Cache-Control: no-store');
-            header('Cloudflare-CDN-Cache-Control: no-store');
-            
-            // Додаємо meta теги через wp_head
-            add_action('wp_head', [$this, 'add_no_cache_meta'], 1);
-        }
-    }
-    
-    /**
-     * Meta теги для заборони кешування
-     */
-    public function add_no_cache_meta() {
-        echo '<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">' . "\n";
-        echo '<meta http-equiv="Pragma" content="no-cache">' . "\n";
-        echo '<meta http-equiv="Expires" content="0">' . "\n";
     }
     
     /**
@@ -209,6 +156,9 @@ class IP_Status_Lamp {
     }
     
     public function sanitize_settings($input) {
+        // Скинути кеш при зміні налаштувань
+        delete_transient('ip_status_lamp_result');
+
         $sanitized = [];
         
         // IP-адреса: валідація IP або домену
@@ -334,7 +284,7 @@ class IP_Status_Lamp {
         echo '<input type="number" name="' . $this->option_name . '[ping_interval]" 
               value="' . esc_attr($settings['ping_interval']) . '" 
               min="1" max="60" style="width: 80px;"> хвилин';
-        echo '<p class="description">Інтервал автоматичного оновлення статусу на сторінці</p>';
+        echo '<p class="description">Мінімальний інтервал між реальними PING-перевірками (кеш)</p>';
     }
     
     public function render_field_ping_count() {
@@ -447,7 +397,7 @@ class IP_Status_Lamp {
         echo '</table>';
         
         echo '<p><a href="' . esc_url(admin_url('options-general.php?page=ip-status-lamp')) . '" class="button">🔄 Оновити</a></p>';
-        echo '<p class="description">⚡ Кешування вимкнено — кожен запит виконує реальний ping</p>';
+        echo '<p class="description">⚡ Тестування виконує реальний ping (без кешу)</p>';
     }
     
     /**
@@ -491,20 +441,22 @@ class IP_Status_Lamp {
         $is_windows = strtoupper(substr(PHP_OS, 0, 3)) === 'WIN';
         
         for ($i = 0; $i < $count; $i++) {
+            $output = [];
+
             if ($is_windows) {
                 // Windows: ping -n 1 -w timeout_ms
-                $cmd = sprintf('ping -n 1 -w %d %s', 
-                    $timeout * 1000, 
+                $cmd = sprintf('ping -n 1 -w %d %s',
+                    $timeout * 1000,
                     escapeshellarg($target)
                 );
             } else {
                 // Linux/Unix: ping -c 1 -W timeout_sec
-                $cmd = sprintf('ping -c 1 -W %d %s 2>&1', 
-                    $timeout, 
+                $cmd = sprintf('ping -c 1 -W %d %s 2>&1',
+                    $timeout,
                     escapeshellarg($target)
                 );
             }
-            
+
             exec($cmd, $output, $return_code);
             
             if ($return_code === 0) {
@@ -529,6 +481,26 @@ class IP_Status_Lamp {
     }
     
     /**
+     * Отримати статус з кешу (transient) або виконати ping
+     */
+    public function get_cached_status() {
+        $transient_key = 'ip_status_lamp_result';
+        $cached = get_transient($transient_key);
+
+        if (false !== $cached) {
+            return $cached;
+        }
+
+        $result = $this->perform_ping();
+        $settings = $this->get_settings();
+        $ttl = max(1, (int) $settings['ping_interval']) * 60;
+
+        set_transient($transient_key, $result, $ttl);
+
+        return $result;
+    }
+
+    /**
      * ========================================
      * REST API
      * ========================================
@@ -538,27 +510,21 @@ class IP_Status_Lamp {
         register_rest_route('ip-status-lamp/v1', '/status', [
             'methods' => 'GET',
             'callback' => [$this, 'rest_get_status'],
-            'permission_callback' => '__return_true',
+            'permission_callback' => function () {
+                return current_user_can('manage_options');
+            },
         ]);
     }
     
     public function rest_get_status() {
-        // Агресивна заборона кешування REST API
-        header('Cache-Control: no-store, no-cache, must-revalidate, max-age=0');
-        header('Pragma: no-cache');
-        header('Expires: Thu, 01 Jan 1970 00:00:00 GMT');
-        header('CDN-Cache-Control: no-store');
-        header('Cloudflare-CDN-Cache-Control: no-store');
-        header('Vary: *');
-        
-        $result = $this->perform_ping();
+        $result = $this->get_cached_status();
         $settings = $this->get_settings();
-        
+
         return [
             'online' => $result['online'],
             'label' => $result['online'] ? $settings['label_online'] : $settings['label_offline'],
             'checked_at' => $result['checked_at'],
-            'timestamp' => time(), // Для дебагу
+            'timestamp' => time(),
         ];
     }
     
@@ -569,24 +535,20 @@ class IP_Status_Lamp {
      */
     
     public function enqueue_frontend_assets() {
-        // CSS
+        global $post;
+
+        if (!is_singular() || empty($post) || !has_shortcode($post->post_content, 'ip_status_lamp')) {
+            return;
+        }
+
         wp_register_style(
             'ip-status-lamp',
             false,
             [],
-            time() // Унікальна версія кожен раз
+            '2.1.0'
         );
         wp_enqueue_style('ip-status-lamp');
         wp_add_inline_style('ip-status-lamp', $this->get_inline_css());
-        
-        // JS з унікальною версією
-        wp_register_script(
-            'ip-status-lamp',
-            false,
-            [],
-            time(), // Унікальна версія кожен раз
-            true
-        );
     }
     
     private function get_inline_css() {
@@ -682,114 +644,50 @@ class IP_Status_Lamp {
         ';
     }
     
-    private function get_inline_js($settings = null) {
-        return "
-        (function() {
-            var wrappers = document.querySelectorAll('.ip-status-lamp-wrapper');
-            if (!wrappers.length) return;
-            
-            wrappers.forEach(function(wrapper) {
-                var svg = wrapper.querySelector('.ip-status-lamp-svg');
-                var label = wrapper.querySelector('.ip-status-lamp-label');
-                var apiUrl = wrapper.getAttribute('data-api-url');
-                var labelOnline = wrapper.getAttribute('data-label-online');
-                var labelOffline = wrapper.getAttribute('data-label-offline');
-                var interval = parseInt(wrapper.getAttribute('data-interval')) || 300000;
-                
-                function updateStatus() {
-                    var url = apiUrl + (apiUrl.indexOf('?') > -1 ? '&' : '?') + '_=' + Date.now();
-                    
-                    fetch(url, {
-                        cache: 'no-store',
-                        headers: {
-                            'Cache-Control': 'no-cache, no-store, must-revalidate',
-                            'Pragma': 'no-cache'
-                        }
-                    })
-                    .then(function(response) { return response.json(); })
-                    .then(function(data) {
-                        svg.classList.remove('online', 'offline', 'loading');
-                        if (label) {
-                            label.classList.remove('online', 'offline', 'loading');
-                        }
-                        
-                        if (data.online) {
-                            svg.classList.add('online');
-                            if (label) {
-                                label.textContent = labelOnline;
-                                label.classList.add('online');
-                            }
-                        } else {
-                            svg.classList.add('offline');
-                            if (label) {
-                                label.textContent = labelOffline;
-                                label.classList.add('offline');
-                            }
-                        }
-                    })
-                    .catch(function() {
-                        svg.classList.remove('online', 'offline');
-                        svg.classList.add('loading');
-                        if (label) {
-                            label.textContent = '...';
-                        }
-                    });
-                }
-                
-                updateStatus();
-                setInterval(updateStatus, interval);
-            });
-        })();
-        ";
-    }
-    
     public function render_shortcode($atts) {
         $atts = shortcode_atts([
             'size' => 'medium',
             'label' => '',
             'position' => '',
         ], $atts);
-        
+
         $settings = $this->get_settings();
-        
+        $result = $this->get_cached_status();
+
         // Позиція: з shortcode або з налаштувань
         $position = !empty($atts['position']) ? $atts['position'] : $settings['position'];
-        
-        // Підключити JS
-        wp_enqueue_script('ip-status-lamp');
-        wp_add_inline_script('ip-status-lamp', $this->get_inline_js($settings));
-        
-        // Унікальний ID для кількох віджетів на сторінці
-        $widget_id = 'ip-lamp-' . wp_rand(1000, 9999);
-        
+
+        // Визначити стан лампочки
+        if (empty($settings['target_ip'])) {
+            $status_class = 'loading';
+            $label_text = '...';
+        } elseif ($result['online']) {
+            $status_class = 'online';
+            $label_text = $settings['label_online'];
+        } else {
+            $status_class = 'offline';
+            $label_text = $settings['label_offline'];
+        }
+
         ob_start();
         ?>
-        <!-- IP Status Lamp v2.0 - <?php echo date('Y-m-d H:i:s'); ?> -->
-        <div class="ip-status-lamp-wrapper position-<?php echo esc_attr($position); ?>" id="<?php echo esc_attr($widget_id); ?>" 
-             data-api-url="<?php echo esc_url(rest_url('ip-status-lamp/v1/status')); ?>"
-             data-label-online="<?php echo esc_attr($settings['label_online']); ?>"
-             data-label-offline="<?php echo esc_attr($settings['label_offline']); ?>"
-             data-interval="<?php echo esc_attr($settings['ping_interval'] * 60 * 1000); ?>">
+        <div class="ip-status-lamp-wrapper position-<?php echo esc_attr($position); ?>">
             <div class="ip-status-lamp-container">
                 <?php if (!empty($atts['label'])): ?>
                     <span class="ip-status-lamp-title"><?php echo esc_html($atts['label']); ?>:</span>
                 <?php endif; ?>
-                
-                <!-- Початковий стан - завантаження -->
-                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" class="ip-status-lamp-svg size-<?php echo esc_attr($atts['size']); ?> loading">
+
+                <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" class="ip-status-lamp-svg size-<?php echo esc_attr($atts['size']); ?> <?php echo esc_attr($status_class); ?>">
                     <path class="lamp-bulb" d="M32 6C23 6 16 13 16 22c0 5.5 2.7 10.3 7 13.4V40h18v-4.6c4.3-3.1 7-7.9 7-13.4 0-9-7-16-16-16z"/>
                     <rect x="23" y="42" width="18" height="4" rx="1" fill="#888"/>
                     <rect x="23" y="48" width="18" height="4" rx="1" fill="#777"/>
                     <rect x="26" y="54" width="12" height="4" rx="2" fill="#666"/>
                 </svg>
-                
+
                 <?php if ($settings['show_label']): ?>
-                    <span class="ip-status-lamp-label loading">...</span>
+                    <span class="ip-status-lamp-label <?php echo esc_attr($status_class); ?>"><?php echo esc_html($label_text); ?></span>
                 <?php endif; ?>
             </div>
-            <noscript>
-                <style>.ip-status-lamp-wrapper { display: none !important; }</style>
-            </noscript>
         </div>
         <?php
         return ob_get_clean();
