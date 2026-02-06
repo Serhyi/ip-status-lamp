@@ -1,0 +1,28 @@
+# IP Status Lamp - Disable caching
+# Додайте цей код в .htaccess в корені сайту WordPress
+
+# Вимкнути кеш для REST API плагіна
+<IfModule mod_headers.c>
+    <If "%{REQUEST_URI} =~ m#/wp-json/ip-status-lamp/#">
+        Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+        Header set Pragma "no-cache"
+        Header set Expires "Thu, 01 Jan 1970 00:00:00 GMT"
+    </If>
+</IfModule>
+
+# Альтернативний варіант - вимкнути кеш для конкретної сторінки
+# Замініть "your-page-slug" на URL вашої сторінки
+#
+# <IfModule mod_headers.c>
+#     <If "%{REQUEST_URI} =~ m#^/your-page-slug/#">
+#         Header set Cache-Control "no-store, no-cache, must-revalidate, max-age=0"
+#         Header set Pragma "no-cache"
+#         Header set Expires "Thu, 01 Jan 1970 00:00:00 GMT"
+#     </If>
+# </IfModule>
+
+# Для GoDaddy специфічно - вимкнути вбудований кеш
+# (може не працювати на всіх планах)
+<IfModule mod_expires.c>
+    ExpiresActive Off
+</IfModule>
